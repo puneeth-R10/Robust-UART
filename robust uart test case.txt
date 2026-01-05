@@ -1,0 +1,435 @@
+`timescale 1ns/1ps
+// uart_stable_verification_tb.v
+// Stable verification TB for uart_top
+// - Full Duplex
+// - Programmable baud (fast/slow)
+// - FIFO buffering (tx_full visibility)
+// - Parity checking (even/odd)
+// - Corruption + TB-driven NAK + retransmit
+// Focused VCD signals for clear waveform verification.
+
+module uart_stable_verification_tb;
+
+    // Clock / Reset
+    reg clk;
+    reg rst_n;
+
+    // Parameters
+    parameter OVERSAMPLE = 16;
+    parameter FIFO_DEPTH = 8;
+
+    // DUT A signals
+    reg  [15:0] baud_div_a;
+    reg  [7:0]  a_tx_data;
+    reg         a_tx_wr;
+    wire        a_tx_full;
+    wire        a_tx_serial;
+    reg         a_rx_serial;
+    wire [7:0]  a_rx_data;
+    wire        a_rx_ready;
+    wire        a_parity_error;
+    wire        a_baud_tick;
+    wire        a_oversample_tick;
+
+    // DUT B signals
+    reg  [15:0] baud_div_b;
+    reg  [7:0]  b_tx_data;
+    reg         b_tx_wr;
+    wire        b_tx_full;
+    wire        b_tx_serial;
+    reg         b_rx_serial;
+    wire [7:0]  b_rx_data;
+    wire        b_rx_ready;
+    wire        b_parity_error;
+    wire        b_baud_tick;
+    wire        b_oversample_tick;
+
+    // parity control (selectable)
+    reg a_parity_en, a_parity_type;
+    reg b_parity_en, b_parity_type;
+
+    // corruption / retransmit control
+    reg B_corrupt_nextframe;      // TB will invert a single bit on next B->A frame
+    reg nak_request_A_to_B;       // TB visible "NAK" request signal (for waveform)
+
+    // TB-sampled parity events (1-cycle pulses) and latched values
+    reg a_parity_event;
+    reg b_parity_event;
+    reg a_parity_latched;
+    reg b_parity_latched;
+
+    integer i;
+
+    // Instantiate UART A
+    uart_top #(
+        .DATA_WIDTH(8),
+        .FIFO_DEPTH(FIFO_DEPTH),
+        .ADDR_WIDTH(3),
+        .OVERSAMPLE(OVERSAMPLE)
+    ) UART_A (
+        .clk(clk),
+        .rst_n(rst_n),
+        .baud_divisor(baud_div_a),
+        .tx_data(a_tx_data),
+        .tx_wr_en(a_tx_wr),
+        .tx_full(a_tx_full),
+        .tx_serial(a_tx_serial),
+        .rx_serial(a_rx_serial),
+        .parity_en(a_parity_en),
+        .parity_type(a_parity_type),
+        .rx_data_out(a_rx_data),
+        .rx_ready_out(a_rx_ready),
+        .rx_empty(),             // unused
+        .parity_error(a_parity_error),
+        .oversample_tick(a_oversample_tick),
+        .baud_tick(a_baud_tick)
+    );
+
+    // Instantiate UART B
+    uart_top #(
+        .DATA_WIDTH(8),
+        .FIFO_DEPTH(FIFO_DEPTH),
+        .ADDR_WIDTH(3),
+        .OVERSAMPLE(OVERSAMPLE)
+    ) UART_B (
+        .clk(clk),
+        .rst_n(rst_n),
+        .baud_divisor(baud_div_b),
+        .tx_data(b_tx_data),
+        .tx_wr_en(b_tx_wr),
+        .tx_full(b_tx_full),
+        .tx_serial(b_tx_serial),
+        .rx_serial(b_rx_serial),
+        .parity_en(b_parity_en),
+        .parity_type(b_parity_type),
+        .rx_data_out(b_rx_data),
+        .rx_ready_out(b_rx_ready),
+        .rx_empty(),             // unused
+        .parity_error(b_parity_error),
+        .oversample_tick(b_oversample_tick),
+        .baud_tick(b_baud_tick)
+    );
+
+    // Clock 100 MHz (10 ns)
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk;
+    end
+
+    // Initialize regs and reset
+    initial begin
+        rst_n = 0;
+        baud_div_a = 16'd50;
+        baud_div_b = 16'd50;
+        a_tx_data = 8'h00; a_tx_wr = 1'b0;
+        b_tx_data = 8'h00; b_tx_wr = 1'b0;
+        a_parity_en = 1; a_parity_type = 0;  // A default even parity
+        b_parity_en = 1; b_parity_type = 0;  // B default even parity
+        a_rx_serial = 1'b1;
+        b_rx_serial = 1'b1;
+        B_corrupt_nextframe = 1'b0;
+        nak_request_A_to_B = 1'b0;
+        a_parity_event = 1'b0; b_parity_event = 1'b0;
+        a_parity_latched = 1'b0; b_parity_latched = 1'b0;
+        #100;
+        rst_n = 1;
+    end
+
+    // ---------- Simple loopback with optional corruption ----------
+    // We drive B.rx_serial from A.tx_serial with optional corruption, and
+    // drive A.rx_serial from B.tx_serial (no corruption).
+    // Corruption is applied at the approximate first data bit (coarse but effective in TB)
+    reg prev_a_tx, prev_b_tx;
+    reg in_frame_A, in_frame_B;
+    reg [7:0] bitcnt_A, bitcnt_B;
+
+    initial begin
+        prev_a_tx = 1'b1;
+        prev_b_tx = 1'b1;
+        in_frame_A = 1'b0;
+        in_frame_B = 1'b0;
+        bitcnt_A = 0;
+        bitcnt_B = 0;
+    end
+
+    // A -> B (with optional corruption from TB)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            prev_a_tx <= 1'b1;
+            in_frame_A <= 1'b0;
+            bitcnt_A <= 0;
+            b_rx_serial <= 1'b1;
+        end else begin
+            prev_a_tx <= a_tx_serial;
+
+            // detect start bit (falling edge)
+            if (!in_frame_A && prev_a_tx && !a_tx_serial) begin
+                in_frame_A <= 1'b1;
+                bitcnt_A <= 0;
+            end
+
+            // count baud ticks to approximate bit positions
+            if (in_frame_A && a_baud_tick) begin
+                bitcnt_A <= bitcnt_A + 1;
+            end
+
+            // apply corruption only at a chosen bit count (1 is first data bit approx)
+            if (in_frame_A) begin
+                if (B_corrupt_nextframe && (bitcnt_A == 1)) begin
+                    b_rx_serial <= ~a_tx_serial; // invert bit
+                end else begin
+                    b_rx_serial <= a_tx_serial;
+                end
+            end else begin
+                b_rx_serial <= a_tx_serial;
+            end
+
+            // frame end (start + data(8) + parity? + stop(1))
+            if (in_frame_A && (bitcnt_A >= (1 + 8 + (b_parity_en ? 1 : 0) + 1))) begin
+                in_frame_A <= 1'b0;
+                bitcnt_A <= 0;
+                B_corrupt_nextframe <= 1'b0; // auto clear corruption after use
+            end
+        end
+    end
+
+    // B -> A (clean)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            prev_b_tx <= 1'b1;
+            in_frame_B <= 1'b0;
+            bitcnt_B <= 0;
+            a_rx_serial <= 1'b1;
+        end else begin
+            prev_b_tx <= b_tx_serial;
+
+            if (!in_frame_B && prev_b_tx && !b_tx_serial) begin
+                in_frame_B <= 1'b1;
+                bitcnt_B <= 0;
+            end
+
+            if (in_frame_B && b_baud_tick) begin
+                bitcnt_B <= bitcnt_B + 1;
+            end
+
+            if (in_frame_B) a_rx_serial <= b_tx_serial;
+            else a_rx_serial <= b_tx_serial;
+
+            if (in_frame_B && (bitcnt_B >= (1 + 8 + (a_parity_en ? 1 : 0) + 1))) begin
+                in_frame_B <= 1'b0;
+                bitcnt_B <= 0;
+            end
+        end
+    end
+
+    // ---------- TB-side parity sampling: capture parity exactly when rx_ready pulses ----------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            a_parity_event <= 1'b0;
+            b_parity_event <= 1'b0;
+            a_parity_latched <= 1'b0;
+            b_parity_latched <= 1'b0;
+        end else begin
+            // default: clear 1-cycle event pulses
+            a_parity_event <= 1'b0;
+            b_parity_event <= 1'b0;
+
+            if (a_rx_ready) begin
+                a_parity_latched <= a_parity_error;
+                if (a_parity_error) a_parity_event <= 1'b1;
+            end
+
+            if (b_rx_ready) begin
+                b_parity_latched <= b_parity_error;
+                if (b_parity_error) b_parity_event <= 1'b1;
+            end
+        end
+    end
+
+    // ---------- Safe transmit tasks ----------
+    task safe_send_A(input [7:0] byte);
+        begin
+            // wait until both lines idle and no in-frame activity
+            while ((a_tx_serial == 1'b0) || (b_tx_serial == 1'b0) || in_frame_A || in_frame_B) @(posedge clk);
+            // send when FIFO has space
+            wait (a_tx_full == 1'b0);
+            a_tx_data = byte;
+            @(posedge clk);
+            a_tx_wr = 1'b1;
+            @(posedge clk);
+            a_tx_wr = 1'b0;
+        end
+    endtask
+
+    task safe_send_B(input [7:0] byte);
+        begin
+            while ((a_tx_serial == 1'b0) || (b_tx_serial == 1'b0) || in_frame_A || in_frame_B) @(posedge clk);
+            wait (b_tx_full == 1'b0);
+            b_tx_data = byte;
+            @(posedge clk);
+            b_tx_wr = 1'b1;
+            @(posedge clk);
+            b_tx_wr = 1'b0;
+        end
+    endtask
+
+    // ---------- Safe simultaneous baud set task ----------
+    task safe_set_baud(input [15:0] div);
+        integer timeout;
+        begin
+            timeout = 0;
+            // wait for both transmitters to be idle
+            while ((a_tx_serial == 1'b0) || (b_tx_serial == 1'b0) || in_frame_A || in_frame_B) begin
+                @(posedge clk);
+                timeout = timeout + 1;
+                if (timeout > 200000) begin
+                    $display("WARNING: safe_set_baud waiting too long for idle. Forcing set.");
+                    disable safe_set_baud;
+                end
+            end
+            baud_div_a = div;
+            baud_div_b = div;
+            // small settle time
+            repeat (12) @(posedge clk);
+        end
+    endtask
+
+    // ---------- Focused waveform (only verification signals) ----------
+    initial begin
+        $dumpfile("uart_stable_verify.vcd");
+        // dump just the signals needed for verification
+        $dumpvars(0, uart_stable_verification_tb.a_tx_serial,
+                      uart_stable_verification_tb.b_tx_serial,
+                      uart_stable_verification_tb.a_rx_serial,
+                      uart_stable_verification_tb.b_rx_serial,
+                      uart_stable_verification_tb.a_rx_data,
+                      uart_stable_verification_tb.b_rx_data,
+                      uart_stable_verification_tb.a_rx_ready,
+                      uart_stable_verification_tb.b_rx_ready,
+                      uart_stable_verification_tb.a_parity_event,
+                      uart_stable_verification_tb.b_parity_event,
+                      uart_stable_verification_tb.a_tx_full,
+                      uart_stable_verification_tb.b_tx_full,
+                      uart_stable_verification_tb.baud_div_a,
+                      uart_stable_verification_tb.baud_div_b,
+                      uart_stable_verification_tb.nak_request_A_to_B
+                      );
+    end
+
+    // ---------- Main test sequence ----------
+    initial begin
+        #200;
+
+        $display("\n--- TEST 1: Full-duplex baseline (even parity) ---");
+        a_parity_en = 1; a_parity_type = 0;
+        b_parity_en = 1; b_parity_type = 0;
+        safe_set_baud(16'd50);
+        fork
+            safe_send_A(8'hA5);
+            safe_send_B(8'h5A);
+        join
+        // wait for both to receive
+        wait (a_rx_ready == 1'b1);
+        wait (b_rx_ready == 1'b1);
+        #2;
+        $display("A received: 0x%0h parity_err(sampled)=%b ; B received: 0x%0h parity_err(sampled)=%b",
+                 a_rx_data, a_parity_latched, b_rx_data, b_parity_latched);
+
+        #200;
+
+        $display("\n--- TEST 2: Baud change visibility (fast -> slow -> fast) ---");
+        // fast
+        safe_set_baud(16'd40);
+        safe_send_A(8'h11);
+        wait (b_rx_ready == 1'b1);
+        #2;
+        // slow
+        safe_set_baud(16'd160);
+        safe_send_A(8'h22);
+        wait (b_rx_ready == 1'b1);
+        #2;
+        // back fast
+        safe_set_baud(16'd40);
+        safe_send_A(8'h33);
+        wait (b_rx_ready == 1'b1);
+        #2;
+
+        #200;
+
+        $display("\n--- TEST 3: FIFO buffering demonstration ---");
+        // slower baud so FIFO will fill easily
+        safe_set_baud(16'd120);
+        a_parity_en = 0; b_parity_en = 0; // disable parity for this stress test
+        for (i = 0; i < (FIFO_DEPTH + 4); i = i + 1) begin
+            safe_send_A(8'h60 + i);
+            #3;
+            if (a_tx_full) $display("Time %0t: A.tx_full asserted after %0d writes", $time, i+1);
+        end
+        // let B receive some bytes
+        for (i = 0; i < FIFO_DEPTH; i = i + 1) begin
+            wait (b_rx_ready == 1'b1);
+            #1;
+            $display("B received: 0x%0h (parity disabled)", b_rx_data);
+        end
+
+        #200;
+
+        $display("\n--- TEST 4: Parity check (odd vs even) ---");
+        // A expects odd, B sends odd -> OK
+        a_parity_en = 1; a_parity_type = 1; // odd on A
+        b_parity_en = 1; b_parity_type = 1; // odd on B
+        safe_set_baud(16'd50);
+        safe_send_B(8'h3C);
+        wait (a_rx_ready == 1'b1);
+        #2;
+        $display("A got 0x%0h parity_err(sampled)=%b (expect 0)", a_rx_data, a_parity_latched);
+
+        // Now mismatch parity modes: A=even, B=odd -> expect parity error
+        a_parity_en = 1; a_parity_type = 0; // even on A
+        b_parity_en = 1; b_parity_type = 1; // odd on B
+        safe_set_baud(16'd50);
+        safe_send_B(8'hF0);
+        wait (a_rx_ready == 1'b1);
+        #2;
+        $display("A got 0x%0h parity_err(sampled)=%b (expect 1)", a_rx_data, a_parity_latched);
+
+        #200;
+
+        $display("\n--- TEST 5: Corruption + NAK (TB-driven) + retransmit ---");
+        // both sides expect even parity
+        a_parity_en = 1; a_parity_type = 0;
+        b_parity_en = 1; b_parity_type = 0;
+        safe_set_baud(16'd50);
+
+        // prepare to corrupt next B->A frame
+        B_corrupt_nextframe = 1;
+        // send corrupted frame
+        nak_request_A_to_B = 0;
+        safe_send_B(8'h7E);
+        wait (a_rx_ready == 1'b1);
+        #2;
+        if (a_parity_latched) begin
+            $display("TB: A detected parity error for 0x7E at time %0t. Requesting resend.", $time);
+            // TB indicates NAK to B (visual only)
+            nak_request_A_to_B = 1;
+            #10; nak_request_A_to_B = 0;
+
+            // resend same byte (uncorrupted)
+            B_corrupt_nextframe = 0;
+            safe_send_B(8'h7E);
+            wait (a_rx_ready == 1'b1);
+            #2;
+            if (!a_parity_latched && a_rx_data == 8'h7E)
+                $display("Resend successful: A received 0x%0h with parity OK", a_rx_data);
+            else
+                $display("Resend failed: A_rx=0x%0h parity=%b", a_rx_data, a_parity_latched);
+        end else begin
+            $display("Unexpected: corruption not detected by A (latched=%b)", a_parity_latched);
+        end
+
+        #500;
+        $display("\nALL TESTS FINISHED - VCD file: uart_stable_verify.vcd");
+        $finish;
+    end
+
+endmodule

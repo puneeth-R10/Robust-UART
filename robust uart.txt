@@ -1,0 +1,439 @@
+// uart_top_fixed.v
+// Same functionality as your previous uart_top, but without $clog2 usage
+`timescale 1ns/1ps
+
+module uart_top #(
+    parameter DATA_WIDTH = 8,
+    parameter FIFO_DEPTH = 8,
+    // explicitly provide address width for FIFO (log2(FIFO_DEPTH))
+    // For FIFO_DEPTH=8 -> ADDR_WIDTH=3. Increase if DEPTH is larger.
+    parameter ADDR_WIDTH = 3,
+    parameter OVERSAMPLE = 16
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire [15:0] baud_divisor, // clocks per oversample tick
+    // TX interface (host -> uart)
+    input  wire [DATA_WIDTH-1:0] tx_data,
+    input  wire tx_wr_en,
+    output wire tx_full,
+    // serial lines
+    output wire tx_serial,
+    input  wire rx_serial,
+    // parity control
+    input  wire parity_en,
+    input  wire parity_type, // 0=even,1=odd
+    // receiver outputs
+    output wire [DATA_WIDTH-1:0] rx_data_out,
+    output wire rx_ready_out,
+    output wire rx_empty,
+    output wire parity_error,
+    // useful ticks for instrumentation
+    output wire oversample_tick,
+    output wire baud_tick
+);
+
+    // internal wires
+    wire tx_fifo_empty;
+    wire [DATA_WIDTH-1:0] tx_fifo_out;
+    wire tx_fifo_rd_en; // pulse from uart_tx_v3 to read fifo (1 cycle)
+    wire [DATA_WIDTH-1:0] rx_fifo_in;
+    wire rx_fifo_wr_en;
+
+    // Instantiate baud/oversample generator
+    baud_gen #(.OVERSAMPLE(OVERSAMPLE)) baud_inst (
+        .clk(clk),
+        .rst_n(rst_n),
+        .baud_divisor(baud_divisor),
+        .oversample_tick(oversample_tick),
+        .baud_tick(baud_tick)
+    );
+
+    // TX FIFO (synchronous read)
+    fifo_sync #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .DEPTH(FIFO_DEPTH),
+        .ADDR_WIDTH(ADDR_WIDTH)
+    ) tx_fifo (
+        .clk(clk),
+        .rst_n(rst_n),
+        .wr_en(tx_wr_en),
+        .rd_en(tx_fifo_rd_en),
+        .data_in(tx_data),
+        .data_out(tx_fifo_out),
+        .full(tx_full),
+        .empty(tx_fifo_empty)
+    );
+
+    // UART transmitter: uses read-then-latch handshake
+    uart_tx_v3 #(.DATA_WIDTH(DATA_WIDTH)) tx_inst (
+        .clk(clk),
+        .rst_n(rst_n),
+        .baud_tick(baud_tick),
+        .tx_fifo_out(tx_fifo_out),
+        .fifo_not_empty(~tx_fifo_empty),
+        .tx_serial(tx_serial),
+        .tx_done(),            // unused
+        .fifo_rd_req(tx_fifo_rd_en),
+        .parity_en(parity_en),
+        .parity_type(parity_type)
+    );
+
+    // RX FIFO to buffer received bytes (optional)
+    fifo_sync #(
+        .DATA_WIDTH(DATA_WIDTH),
+        .DEPTH(FIFO_DEPTH),
+        .ADDR_WIDTH(ADDR_WIDTH)
+    ) rx_fifo (
+        .clk(clk),
+        .rst_n(rst_n),
+        .wr_en(rx_fifo_wr_en),
+        .rd_en(1'b0), // not reading from TB, we expose direct latch
+        .data_in(rx_fifo_in),
+        .data_out(),  // unused
+        .full(),
+        .empty(rx_empty)
+    );
+
+    // Oversampling receiver: writes into rx_fifo_in and pulses rx_fifo_wr_en
+    uart_rx_oversample_v2 #(.DATA_WIDTH(DATA_WIDTH), .OVERSAMPLE(OVERSAMPLE)) rx_inst (
+        .clk(clk),
+        .rst_n(rst_n),
+        .oversample_tick(oversample_tick),
+        .rx_serial(rx_serial),
+        .parity_en(parity_en),
+        .parity_type(parity_type),
+        .rx_data(rx_fifo_in),
+        .rx_ready(rx_fifo_wr_en),
+        .parity_error(parity_error)
+    );
+
+    // Expose the last received byte and a 1-cycle ready pulse for TB
+    reg [DATA_WIDTH-1:0] rx_data_reg;
+    reg rx_ready_reg;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rx_data_reg <= {DATA_WIDTH{1'b0}};
+            rx_ready_reg <= 1'b0;
+        end else begin
+            if (rx_fifo_wr_en) begin
+                rx_data_reg <= rx_fifo_in;
+                rx_ready_reg <= 1'b1;
+            end else begin
+                rx_ready_reg <= 1'b0;
+            end
+        end
+    end
+    assign rx_data_out = rx_data_reg;
+    assign rx_ready_out = rx_ready_reg;
+
+endmodule
+
+//=================================================================
+// Baud / Oversample Generator (no $clog2 required)
+//=================================================================
+module baud_gen #(
+    parameter OVERSAMPLE = 16
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire [15:0] baud_divisor,
+    output reg oversample_tick,
+    output reg baud_tick
+);
+    reg [15:0] counter;
+    reg [7:0] ov_count; // wide enough for typical OVERSAMPLE values
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            counter <= 0;
+            ov_count <= 0;
+            oversample_tick <= 0;
+            baud_tick <= 0;
+        end else begin
+            if (counter >= baud_divisor - 1) begin
+                counter <= 0;
+                oversample_tick <= 1;
+                if (ov_count == OVERSAMPLE - 1) begin
+                    ov_count <= 0;
+                    baud_tick <= 1;
+                end else begin
+                    ov_count <= ov_count + 1;
+                    baud_tick <= 0;
+                end
+            end else begin
+                counter <= counter + 1;
+                oversample_tick <= 0;
+                baud_tick <= 0;
+            end
+        end
+    end
+endmodule
+
+//=================================================================
+// Synchronous FIFO (simple circular buffer)
+// Uses parameter ADDR_WIDTH instead of $clog2
+//=================================================================
+module fifo_sync #(
+    parameter DATA_WIDTH = 8,
+    parameter DEPTH = 8,
+    parameter ADDR_WIDTH = 3   // must satisfy 2**ADDR_WIDTH >= DEPTH
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire wr_en,
+    input  wire rd_en,
+    input  wire [DATA_WIDTH-1:0] data_in,
+    output reg  [DATA_WIDTH-1:0] data_out,
+    output wire full,
+    output wire empty
+);
+    // pointers and count (use safe widths)
+    reg [ADDR_WIDTH-1:0] wr_ptr, rd_ptr;
+    reg [31:0] count;
+    reg [DATA_WIDTH-1:0] mem [0:DEPTH-1];
+    integer i;
+
+    assign full = (count >= DEPTH);
+    assign empty = (count == 0);
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            wr_ptr <= {ADDR_WIDTH{1'b0}};
+            rd_ptr <= {ADDR_WIDTH{1'b0}};
+            count <= 0;
+            data_out <= {DATA_WIDTH{1'b0}};
+            for (i = 0; i < DEPTH; i = i + 1) mem[i] <= {DATA_WIDTH{1'b0}};
+        end else begin
+            // write operation (write before read if both asserted)
+            if (wr_en && (count < DEPTH)) begin
+                mem[wr_ptr] <= data_in;
+                wr_ptr <= wr_ptr + 1;
+                count <= count + 1;
+            end
+            // read operation: synchronous read - data_out is updated on clock when rd_en asserted
+            if (rd_en && (count > 0)) begin
+                data_out <= mem[rd_ptr];
+                rd_ptr <= rd_ptr + 1;
+                count <= count - 1;
+            end
+        end
+    end
+endmodule
+
+//=================================================================
+// uart_tx_v3 - read-then-latch transmitter for synchronous FIFO
+// no changes except removing $clog2 usage
+//=================================================================
+module uart_tx_v3 #(parameter DATA_WIDTH = 8)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire baud_tick,
+    input  wire [DATA_WIDTH-1:0] tx_fifo_out, // from fifo.data_out
+    input  wire fifo_not_empty,               // ~fifo_empty
+    output reg tx_serial,
+    output reg tx_done,
+    output reg fifo_rd_req,                   // pulse to FIFO rd_en
+    input  wire parity_en,
+    input  wire parity_type
+);
+    localparam IDLE      = 0,
+               ISSUE_RD  = 1,
+               LATCH     = 2,
+               START     = 3,
+               DATA      = 4,
+               PARITY    = 5,
+               STOP      = 6;
+
+    reg [2:0] state;
+    reg [4:0] bit_index;
+    reg [DATA_WIDTH-1:0] shift_reg;
+    reg parity;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= IDLE;
+            tx_serial <= 1'b1;
+            tx_done <= 1'b0;
+            fifo_rd_req <= 1'b0;
+            bit_index <= 0;
+            shift_reg <= 0;
+            parity <= 0;
+        end else begin
+            // defaults
+            tx_done <= 1'b0;
+            fifo_rd_req <= 1'b0;
+
+            case (state)
+                IDLE: begin
+                    tx_serial <= 1'b1;
+                    if (fifo_not_empty) begin
+                        // request FIFO to present next data on data_out next cycle
+                        fifo_rd_req <= 1'b1;
+                        state <= ISSUE_RD;
+                    end
+                end
+
+                ISSUE_RD: begin
+                    // wait one cycle for FIFO.data_out to update
+                    state <= LATCH;
+                end
+
+                LATCH: begin
+                    // latch the value now available on tx_fifo_out
+                    shift_reg <= tx_fifo_out;
+                    parity <= parity_type ? ~(^tx_fifo_out) : ^tx_fifo_out;
+                    bit_index <= 0;
+                    state <= START;
+                end
+
+                START: begin
+                    if (baud_tick) begin
+                        tx_serial <= 1'b0; // start bit
+                        state <= DATA;
+                    end
+                end
+
+                DATA: begin
+                    if (baud_tick) begin
+                        tx_serial <= shift_reg[bit_index];
+                        if (bit_index == (DATA_WIDTH - 1)) begin
+                            bit_index <= 0;
+                            state <= (parity_en ? PARITY : STOP);
+                        end else begin
+                            bit_index <= bit_index + 1;
+                        end
+                    end
+                end
+
+                PARITY: begin
+                    if (baud_tick) begin
+                        tx_serial <= parity;
+                        state <= STOP;
+                    end
+                end
+
+                STOP: begin
+                    if (baud_tick) begin
+                        tx_serial <= 1'b1;
+                        tx_done <= 1'b1;
+                        state <= IDLE;
+                    end
+                end
+
+                default: state <= IDLE;
+            endcase
+        end
+    end
+endmodule
+
+//=================================================================
+// uart_rx_oversample_v2 - oversampled receiver (samples mid-bit)
+// using fixed-size counters (no $clog2)
+//=================================================================
+module uart_rx_oversample_v2 #(
+    parameter DATA_WIDTH = 8,
+    parameter OVERSAMPLE = 16
+)(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire oversample_tick,
+    input  wire rx_serial,
+    input  wire parity_en,
+    input  wire parity_type,
+    output reg [DATA_WIDTH-1:0] rx_data,
+    output reg rx_ready,
+    output reg parity_error
+);
+    localparam IDLE=0, START=1, DATA=2, PARITY=3, STOP=4;
+    reg [2:0] state;
+    reg [15:0] sample_cnt; // wide enough for OVERSAMPLE up to large values
+    reg [3:0] bit_index;
+    reg [DATA_WIDTH-1:0] shift_reg;
+    reg sampled_parity;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= IDLE;
+            rx_ready <= 1'b0;
+            parity_error <= 1'b0;
+            sample_cnt <= 0;
+            bit_index <= 0;
+            shift_reg <= 0;
+            sampled_parity <= 0;
+            rx_data <= 0;
+        end else begin
+            // default single-cycle pulse clearing
+            rx_ready <= 1'b0;
+
+            if (oversample_tick) begin
+                case(state)
+                    IDLE: begin
+                        if (!rx_serial) begin
+                            sample_cnt <= 1;
+                            state <= START;
+                        end
+                    end
+
+                    START: begin
+                        sample_cnt <= sample_cnt + 1;
+                        if (sample_cnt == (OVERSAMPLE/2)) begin
+                            if (!rx_serial) begin
+                                sample_cnt <= 0;
+                                bit_index <= 0;
+                                state <= DATA;
+                            end else begin
+                                state <= IDLE;
+                            end
+                        end
+                    end
+
+                    DATA: begin
+                        sample_cnt <= sample_cnt + 1;
+                        if (sample_cnt == (OVERSAMPLE/2)) begin
+                            shift_reg[bit_index] <= rx_serial;
+                        end
+                        if (sample_cnt == (OVERSAMPLE-1)) begin
+                            sample_cnt <= 0;
+                            if (bit_index == (DATA_WIDTH-1)) begin
+                                bit_index <= 0;
+                                state <= (parity_en ? PARITY : STOP);
+                            end else begin
+                                bit_index <= bit_index + 1;
+                            end
+                        end
+                    end
+
+                    PARITY: begin
+                        sample_cnt <= sample_cnt + 1;
+                        if (sample_cnt == (OVERSAMPLE/2)) begin
+                            sampled_parity <= rx_serial;
+                        end
+                        if (sample_cnt == (OVERSAMPLE-1)) begin
+                            sample_cnt <= 0;
+                            state <= STOP;
+                        end
+                    end
+
+                    STOP: begin
+                        sample_cnt <= sample_cnt + 1;
+                        if (sample_cnt == (OVERSAMPLE/2)) begin
+                            rx_data <= shift_reg;
+                            rx_ready <= 1'b1;
+                            if (parity_en) begin
+                                if (parity_type)
+                                    parity_error <= (sampled_parity != ~(^shift_reg));
+                                else
+                                    parity_error <= (sampled_parity != ^shift_reg);
+                            end else parity_error <= 1'b0;
+                        end
+                        if (sample_cnt == (OVERSAMPLE-1)) begin
+                            sample_cnt <= 0;
+                            state <= IDLE;
+                        end
+                    end
+                endcase
+            end
+        end
+    end
+endmodule
