@@ -2,7 +2,7 @@
 
 
 
-📌 Project Overview
+**📌 Project Overview**
 
 This project presents the design and simulation of a robust UART (Universal Asynchronous Receiver Transmitter) implemented in Verilog HDL. The design focuses on reliability, configurability, and real-world robustness, addressing common challenges in serial communication such as baud mismatch, data loss, and transmission errors.
 
@@ -10,7 +10,7 @@ The UART supports full-duplex communication, programmable baud rate, FIFO buffer
 
 
 
-🎯 Key Features
+**🎯 Key Features**
 
 Full-Duplex Communication
 Simultaneous transmission and reception of data using independent TX and RX paths.
@@ -32,7 +32,7 @@ On detecting a parity error, the testbench simulates a NAK request and forces re
 
 
 
-🧱 Architecture Description
+**🧱 Architecture Description**
 
 Transmitter (TX) Path
 
@@ -70,7 +70,7 @@ baud_divisor = Clock_Frequency / (Baud_Rate × Oversampling_Factor)
 
 
 
-🧪 Verification Strategy
+**🧪 Verification Strategy**
 
 A stable, self-checking testbench is used to validate all core UART functions.
 
@@ -94,7 +94,7 @@ The testbench is designed to ensure all critical signals toggle at least once, m
 
 
 
-📊 Waveform Observation
+**📊 Waveform Observation**
 
 The waveform verifies:
 
@@ -110,7 +110,7 @@ Only essential signals are dumped to keep waveforms clean and easy to analyze.
 
 
 
-🛠 Tools & Technologies
+**🛠 Tools & Technologies**
 
 Language: Verilog HDL
 
@@ -122,7 +122,7 @@ Verification: Self-checking testbench with fault injection
 
 
 
-🚀 Applications
+**🚀 Applications**
 
 Embedded systems communication
 
@@ -132,6 +132,6 @@ ASIC/VLSI design practice
 
 Reliable data links in noisy environments
 
-📌 Conclusion
+**📌 Conclusion**
 
 This project demonstrates a practical, industry-relevant UART design with strong emphasis on reliability, error handling, and verification. The combination of FIFO buffering, oversampling, and parity checking makes the UART robust and suitable for real-world deployment.
