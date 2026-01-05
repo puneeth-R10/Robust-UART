@@ -1,12 +1,4 @@
 `timescale 1ns/1ps
-// uart_stable_verification_tb.v
-// Stable verification TB for uart_top
-// - Full Duplex
-// - Programmable baud (fast/slow)
-// - FIFO buffering (tx_full visibility)
-// - Parity checking (even/odd)
-// - Corruption + TB-driven NAK + retransmit
-// Focused VCD signals for clear waveform verification.
 
 module uart_stable_verification_tb;
 
@@ -431,5 +423,6 @@ module uart_stable_verification_tb;
         $display("\nALL TESTS FINISHED - VCD file: uart_stable_verify.vcd");
         $finish;
     end
+
 
 endmodule
